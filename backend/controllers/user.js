@@ -3,10 +3,11 @@ const User = require("../models/User");
 const Post = require("../models/Post");
 const { sendEmail } = require("../middlewares/sendEmail");
 const crypto = require("crypto");
+const cloudinary = require("cloudinary");
 
 exports.register = async (req, res) => {
   try {
-    const { name, email, password } = req.body;
+    const { name, email, password, avatar } = req.body;
 
     let user = await User.findOne({ email });
     if (user) {
@@ -15,11 +16,15 @@ exports.register = async (req, res) => {
         .json({ success: false, message: "User already exists" });
     }
 
+    const myCloud = await cloudinary.v2.uploader.upload(avatar, {
+      folder: "avatars",
+    });
+
     user = await User.create({
       name,
       email,
       password,
-      avatar: { public_id: "sample_id", url: "sampleurl" },
+      avatar: { public_id: myCloud.public_id, url: myCloud.secure_url },
     });
 
     const token = await user.generateToken();
@@ -45,7 +50,9 @@ exports.register = async (req, res) => {
 exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await User.findOne({ email }).select("+password");
+    const user = await User.findOne({ email })
+      .select("+password")
+      .populate("posts followers following");
     if (!user) {
       return res.status(400).json({
         success: false,
@@ -182,13 +189,21 @@ exports.updatePassword = async (req, res) => {
 exports.updateProfile = async (req, res) => {
   try {
     const user = await User.findById(req.user._id);
-    const { name, email } = req.body;
+    const { name, email, avatar } = req.body;
 
     if (name) {
       user.name = name;
     }
     if (email) {
       user.email = email;
+    }
+    if (avatar) {
+      await cloudinary.v2.uploader.destroy(user.avatar.public_id);
+      const myCloud = await cloudinary.v2.uploader.upload(avatar, {
+        folder: "avatars",
+      });
+      user.avatar.public_id = myCloud.public_id;
+      user.avatar.url = myCloud.secure_url;
     }
 
     // user Avatar: TODO
@@ -213,6 +228,9 @@ exports.deleteMyProfile = async (req, res) => {
     const followers = user.followers;
     const following = user.following;
     const userId = user._id;
+
+    // Removing avatar from cloudinary
+    await cloudinary.v2.uploader.destroy(user.avatar.public_id);
     await user.remove();
     // Logout the user whose profile has been deleted
     res.cookie("token", null, {
@@ -223,6 +241,7 @@ exports.deleteMyProfile = async (req, res) => {
     // Deleting all the posts of the user
     for (let i = 0; i < posts.length; i++) {
       const post = await Post.findById(posts[i]);
+      await cloudinary.v2.uploader.destroy(post.image.public_id);
       await post.remove();
     }
 
@@ -243,6 +262,27 @@ exports.deleteMyProfile = async (req, res) => {
       follows.followers.splice(index, 1);
       await follows.save();
     }
+
+    // removing all comments of the user from all the posts
+    const allPosts = await Post.find();
+    for (let i = 0; i < allPosts.length; i++) {
+      const post = await Post.findById(allPosts[i]._id);
+      for (let j = 0; j < post.comments.length; j++) {
+        if (post.comments[j].user === userId) {
+          post.comments.splice(j, 1);
+        }
+      }
+    }
+    // removing all likes of the user from all the posts
+    for (let i = 0; i < allPosts.length; i++) {
+      const post = await Post.findById(allPosts[i]._id);
+      for (let j = 0; j < post.likes.length; j++) {
+        if (post.likes[j] === userId) {
+          post.likes.splice(j, 1);
+        }
+      }
+      await post.save();
+    }
     res.status(200).json({
       success: true,
       message: "Profile Deleted",
@@ -257,7 +297,9 @@ exports.deleteMyProfile = async (req, res) => {
 
 exports.myProfile = async (req, res) => {
   try {
-    const user = await User.findById(req.user._id).populate("posts");
+    const user = await User.findById(req.user._id).populate(
+      "posts followers following"
+    );
 
     res.status(200).json({
       success: true,
@@ -273,7 +315,9 @@ exports.myProfile = async (req, res) => {
 
 exports.getUserProfile = async (req, res) => {
   try {
-    const user = await User.findById(req.params.id).populate("posts");
+    const user = await User.findById(req.params.id).populate(
+      "posts followers following"
+    );
 
     if (!user) {
       return res.status(404).json({
@@ -296,7 +340,9 @@ exports.getUserProfile = async (req, res) => {
 
 exports.getAllUsers = async (req, res) => {
   try {
-    const users = await User.find({});
+    const users = await User.find({
+      name: { $regex: req.query.search, $options: "i" },
+    });
     res.status(200).json({
       success: true,
       users,
@@ -323,7 +369,7 @@ exports.forgotPassword = async (req, res) => {
     await user.save();
     const resetUrl = `${req.protocol}://${req.get(
       "host"
-    )}/api/v1/password/reset/${resetPasswordToken}`;
+    )}/password/reset/${resetPasswordToken}`;
     const message = `Reset your password by clicking on the link below: ${resetUrl}`;
 
     // sending mail
@@ -386,6 +432,29 @@ exports.resetPassword = async (req, res) => {
     res.status(200).json({
       success: true,
       message: "Password Updated",
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+exports.getUserPosts = async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    const posts = [];
+
+    for (let i = 0; i < user.posts.length; ++i) {
+      const post = await Post.findById(user.posts[i]).populate(
+        "likes comments.user owner"
+      );
+      posts.push(post);
+    }
+    res.status(200).json({
+      success: true,
+      posts,
     });
   } catch (error) {
     res.status(500).json({
